@@ -44,6 +44,7 @@ def tqdmWrapViewBar(*args, **kwargs):
             last[0] = a  # update last known iteration
         return viewBar2, pbar  # return callback, tqdmInstance
 
+
 if args.targetaccesskey is args.targetsecretkey is args.youraccountid is args.yourinstancekey is args.localkeypath is None:
     parser.print_help()
 elif ".pem" in args.yourinstancekey:
