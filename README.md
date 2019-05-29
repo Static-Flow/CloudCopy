@@ -1,12 +1,12 @@
 # CloudCopy
 This script implements a cloud version of the Shadow Copy attack against domain controllers running in AWS. Any AWS user possessing the EC2:CreateSnapshot permission can steal the hashes of all domain users by creating a snapshot of the Domain Controller mounting it to an instance they control and exporting the NTDS.dit and SYSTEM registry hive file for use with Impacket's secretsdump project.
 
-# CloudCopy Algorithm
-1.  Load AWS CLI with Target Creds
-2.  Run "Describe-Instances" and show in list to select
-3.  Run "Create-Snapshot" on volume from selected instance
+# Detailed CloudCopy Algorithm
+1.  Load AWS CLI with Victim Credentials that have at least CreateSnapshot permissions
+2.  Run "Describe-Instances" and show in list for attacker to select
+3.  Run "Create-Snapshot" on volume of selected instance
 4.  Run "modify-snapshot-attribute" on new snapshot to set "createVolumePermission" to attacker AWS Account
-5.  Load AWS CLI with Attacker Creds
+5.  Load AWS CLI with Attacker Credentials
 6.  Run "run-instance" command to create new linux ec2 with our stolen snapshot
 7.  Ssh run "sudo mkdir /windows"
 8.  Ssh run "sudo mount /dev/xvdf1 /windows/"
