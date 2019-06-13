@@ -12,8 +12,7 @@ setup(
     install_requires=[
         'boto3',
         'readline',
-        'cmd',
-        'abc',
-        'paramiko'
+        'paramiko',
+        'pyreadline'
     ],
 )

