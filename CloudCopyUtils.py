@@ -303,8 +303,7 @@ class CloudCopyUtils:
         except ClientError as e:
             if e.response['Error']['Code'] == 'DryRunOperation':
                 self.instanceKey = self.botoClient.create_key_pair(KeyName=self.keyName, DryRun=False)
-                print("Created new key " + self.keyName + " for instance " + self.victimInstance.instance_id +
-                      ". Wrote the PEM file to disc for use later.")
+                print("Created new key " + self.keyName + " for instanced. Wrote the PEM file to disc for use later.")
                 private_key_string = io.StringIO()
                 private_key_string.write(self.instanceKey.key_material)
                 private_key_string.seek(0)
@@ -324,7 +323,6 @@ class CloudCopyUtils:
             if e.response['Error']['Code'] == 'DryRunOperation':
                 print("Dry run succeeded! Creating instance for real.")
                 self._createInstance(False)
-                self.attackingInstance.load()
                 while self.attackingInstance.state['Name'].strip() != "running":
                     print("Your instance will be arriving shortly...")
                     time.sleep(10)
@@ -361,6 +359,7 @@ class CloudCopyUtils:
             MinCount=1,
             InstanceType='t2.micro',
             KeyName=self.keyName)[0]
+        print(self.attackingInstance)
 
     # helper to create the connection to the attacker instance
     def connectToInstance(self):
